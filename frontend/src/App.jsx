@@ -12,7 +12,7 @@ function App() {
         <div style={{ display: 'flex', alignItems: 'center', gap: '1rem' }}>
           <div className="tagline" style={{ display: 'flex', alignItems: 'center', gap: '0.5rem', fontSize: '0.75rem' }}>
             <span style={{ width: '8px', height: '8px', borderRadius: '50%', backgroundColor: '#10b981', display: 'inline-block', animate: 'pulse' }} />
-            <span>Server Online</span>
+            <span>Forecasting Engine Active</span>
           </div>
         </div>
       </header>
