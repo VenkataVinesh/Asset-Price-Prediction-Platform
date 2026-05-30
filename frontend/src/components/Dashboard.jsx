@@ -12,6 +12,120 @@ import {
 } from 'recharts';
 import { Cpu, Activity, TrendingUp, Sliders, RefreshCw, Layers } from 'lucide-react';
 
+const generateMockData = (ticker, model, horizon) => {
+  const configs = {
+    "AAPL": { start_price: 175.0, daily_std: 0.012, drift: 0.0005 },
+    "MSFT": { start_price: 420.0, daily_std: 0.010, drift: 0.0008 },
+    "BTC-USD": { start_price: 64000.0, daily_std: 0.035, drift: 0.0015 }
+  };
+  const config = configs[ticker] || configs["AAPL"];
+  
+  // Seed random walk
+  let prices = [config.start_price];
+  for (let i = 1; i < 60; i++) {
+    let u1 = Math.random();
+    let u2 = Math.random();
+    let randStdNormal = Math.sqrt(-2.0 * Math.log(u1)) * Math.cos(2.0 * Math.PI * u2);
+    let change_pct = config.drift + config.daily_std * randStdNormal;
+    prices.push(prices[prices.length - 1] * (1.0 + change_pct));
+  }
+  
+  // Enrich dataset (calculate sma, ema, rsi, volatility)
+  const history = [];
+  const today = new Date();
+  for (let i = 0; i < 60; i++) {
+    const d = new Date(today);
+    d.setDate(today.getDate() - (59 - i));
+    const dateStr = d.toISOString().split('T')[0];
+    
+    // SMA (14)
+    const smaWindow = prices.slice(Math.max(0, i - 13), i + 1);
+    const sma = smaWindow.reduce((a, b) => a + b, 0) / smaWindow.length;
+    
+    // EMA (14)
+    let ema = prices[0];
+    const k = 2 / (14 + 1);
+    for (let j = 1; j <= i; j++) {
+      ema = prices[j] * k + ema * (1 - k);
+    }
+    
+    // RSI (14)
+    let rsi = 50.0;
+    if (i > 0) {
+      let gains = 0;
+      let losses = 0;
+      for (let j = Math.max(1, i - 13); j <= i; j++) {
+        const diff = prices[j] - prices[j - 1];
+        if (diff > 0) gains += diff;
+        else losses -= diff;
+      }
+      const count = Math.min(i, 14);
+      const avgGain = gains / count;
+      const avgLoss = losses / count;
+      const rs = avgLoss === 0 ? 100 : avgGain / (avgLoss + 1e-9);
+      rsi = avgLoss === 0 ? 100 : 100 - (100 / (1 + rs));
+    }
+    
+    // Volatility (14-day rolling log return std)
+    let volatility = 0.0;
+    if (i > 0) {
+      const returns = [];
+      const startIdx = Math.max(1, i - 13);
+      for (let j = startIdx; j <= i; j++) {
+        returns.push(Math.log(prices[j] / prices[j - 1]));
+      }
+      const avgReturn = returns.reduce((a, b) => a + b, 0) / returns.length;
+      const variance = returns.reduce((a, b) => a + Math.pow(b - avgReturn, 2), 0) / returns.length;
+      volatility = Math.sqrt(variance);
+    }
+    
+    history.push({
+      date: dateStr,
+      close: prices[i],
+      sma: sma,
+      ema: ema,
+      rsi: rsi,
+      volatility: volatility
+    });
+  }
+  
+  // Forecast points
+  const forecast = [];
+  let lastPrice = prices[prices.length - 1];
+  for (let i = 0; i < horizon; i++) {
+    const d = new Date(today);
+    d.setDate(today.getDate() + (i + 1));
+    const dateStr = d.toISOString().split('T')[0];
+    
+    // Simulate trend based on model
+    let factor = 1.0;
+    if (model === 'lstm') {
+      factor = 1.0 + (config.drift * 1.5) + (Math.sin(i / 2) * config.daily_std * 0.4);
+    } else {
+      factor = 1.0 + config.drift * (1.0 - (i / horizon) * 0.5);
+    }
+    const nextPrice = lastPrice * factor;
+    const error_margin = config.start_price * (model === 'lstm' ? 0.015 : 0.012) * (i + 1);
+    
+    forecast.push({
+      date: dateStr,
+      price: nextPrice,
+      lower_bound: nextPrice - error_margin,
+      upper_bound: nextPrice + error_margin
+    });
+    
+    lastPrice = nextPrice;
+  }
+  
+  return {
+    ticker,
+    model,
+    history,
+    forecast,
+    isMock: true
+  };
+};
+
 const Dashboard = () => {
   const [ticker, setTicker] = useState('AAPL');
   const [model, setModel] = useState('lstm');
@@ -25,17 +139,22 @@ const Dashboard = () => {
     try {
       setLoading(true);
       setError(null);
+      
+      const apiBase = import.meta.env.VITE_API_URL || 'http://localhost:8000';
       const response = await fetch(
-        `http://localhost:8000/api/forecast?ticker=${ticker}&model=${model}&horizon=${horizon}`
+        `${apiBase}/api/forecast?ticker=${ticker}&model=${model}&horizon=${horizon}`
       );
       if (!response.ok) {
         throw new Error('API server returned an error');
       }
-      const json = await response.ok ? await response.json() : null;
+      const json = await response.json();
+      json.isMock = false;
       setData(json);
     } catch (err) {
-      setError('Could not connect to FastAPI server. Please ensure the backend is running on port 8000.');
-      console.error(err);
+      console.warn('API connection failed. Falling back to local forecasting simulation.', err);
+      // Run the client-side math forecasting simulator
+      const mockData = generateMockData(ticker, model, horizon);
+      setData(mockData);
     } finally {
       setLoading(false);
       setIsRefreshing(false);
@@ -204,9 +323,20 @@ const Dashboard = () => {
               <TrendingUp size={20} className="text-accent-cyan" />
               <span>Asset Price Prediction Bounds</span>
             </h3>
-            <span className="metric-pill">
-              Model: {model.toUpperCase()} | Ticker: {ticker}
-            </span>
+            <div style={{ display: 'flex', gap: '0.5rem', flexWrap: 'wrap' }}>
+              <span className="metric-pill">
+                Model: {model.toUpperCase()} | Ticker: {ticker}
+              </span>
+              {data?.isMock ? (
+                <span className="metric-pill" style={{ borderColor: '#f59e0b', color: '#f59e0b' }}>
+                  Mode: Simulator (API Offline)
+                </span>
+              ) : (
+                <span className="metric-pill" style={{ borderColor: '#10b981', color: '#10b981' }}>
+                  Mode: Live API
+                </span>
+              )}
+            </div>
           </div>
 
           <div style={{ width: '100%', height: '380px' }}>
