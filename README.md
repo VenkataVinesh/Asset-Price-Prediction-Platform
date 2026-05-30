@@ -4,6 +4,15 @@ An end-to-end time series prediction platform combining deep learning sequential
 
 ---
 
+## 💡 Why I Built This
+This platform was built to explore the boundary between classical statistical forecasting and recurrent deep learning. I wanted to:
+- Compare classical linear models like ARIMA against deep learning models (LSTMs) that capture non-linear dependencies.
+- Build a clean, decoupled system with a robust feature pipeline calculating rolling metrics (RSI, SMA, EMA) on the fly.
+- Gain hands-on experience structuring an asynchronous FastAPI server that serves live model predictions to a dynamic React dashboard.
+
+---
+
+
 ## 📈 System Architecture
 
 The application is structured as a decoupled client-server system containerized with Docker:
@@ -150,3 +159,18 @@ ARIMA computes autoregressive correlations to provide linear trend confidence in
 * **Parameters:** Fits an $ARIMA(p, d, q)$ order. We optimize the parameter combination using the Akaike Information Criterion (AIC):
   $$AIC = 2k - 2\ln(\hat{L})$$
 * **Output:** Returns forecasted paths along with standard error matrices mapping to 95% confidence bounds.
+
+---
+
+## 🌐 Deployment
+
+### Frontend (Vercel)
+The React frontend is optimized for zero-config Vercel hosting.
+- Configuration is provided in `frontend/vercel.json` to handle routing for Single Page Applications (SPAs) by redirecting all paths to `index.html`.
+- To deploy, connect the repository to Vercel and set the Root Directory to `frontend`.
+
+### Backend (Render / Railway)
+The FastAPI backend can be deployed using the `render.yaml` configuration file in the repository root.
+- It specifies a Python environment, installs backend dependencies, and starts the Uvicorn web server.
+- To deploy, import this repository into Render as a Blueprint.
+
