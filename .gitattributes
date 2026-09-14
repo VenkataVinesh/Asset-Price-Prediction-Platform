@@ -1,0 +1,2 @@
+# Exclude the React frontend from GitHub language stats so the repo reports its Python modelling code.
+frontend/** linguist-detectable=false
