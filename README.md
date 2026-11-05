@@ -1,72 +1,100 @@
 # Asset Price Prediction Platform
 
-![Python](https://img.shields.io/badge/Python-3776AB?style=flat-square&logo=python&logoColor=white)
-![PyTorch](https://img.shields.io/badge/PyTorch-EE4C2C?style=flat-square&logo=pytorch&logoColor=white)
-![Statsmodels](https://img.shields.io/badge/Statsmodels-3776AB?style=flat-square)
-![FastAPI](https://img.shields.io/badge/FastAPI-009688?style=flat-square&logo=fastapi&logoColor=white)
-![React](https://img.shields.io/badge/React-20232A?style=flat-square&logo=react&logoColor=61DAFB)
-![Docker](https://img.shields.io/badge/Docker-2496ED?style=flat-square&logo=docker&logoColor=white)
+A stacked LSTM and an AIC-selected ARIMA, served by FastAPI behind a React dashboard. Both are
+evaluated walk-forward against a naive "tomorrow = today" baseline. The prices are **simulated**
+(geometric Brownian motion). On that random walk neither model beats naive, and the dashboard
+says so.
 
-An end-to-end time-series forecasting platform that puts a **deep-learning sequence model (LSTM)**
-and a **classical statistical model (ARIMA)** side by side on the same asset-price data — so you
-can see where each approach wins. A FastAPI backend computes rolling technical indicators on the
-fly and serves multi-step forecasts to an interactive React dashboard.
+[![CI](https://github.com/VenkataVinesh/Asset-Price-Prediction-Platform/actions/workflows/ci.yml/badge.svg)](https://github.com/VenkataVinesh/Asset-Price-Prediction-Platform/actions/workflows/ci.yml)
+![Python 3.11](https://img.shields.io/badge/python-3.11-3776AB)
+![License: MIT](https://img.shields.io/badge/license-MIT-green)
 
-## Why I built this
-To explore the boundary between classical autoregressive forecasting and recurrent deep learning:
-where does an LSTM's ability to model non-linear dependencies actually beat a well-fit ARIMA, and
-what does it cost in complexity? Building it also meant designing a clean, decoupled service —
-feature pipeline, model inference, REST API, dashboard — rather than a notebook.
+![Dashboard: simulated AAPL history, LSTM forecast with validation-residual band, SIMULATED DATA badge, and walk-forward MAE against naive](docs/dashboard.png)
 
-## Architecture
+## Quick start
+
+```bash
+git clone https://github.com/VenkataVinesh/Asset-Price-Prediction-Platform.git
+cd Asset-Price-Prediction-Platform
+
+# Backend (Python 3.10+). CPU is enough.
+cd backend
+pip install -r requirements.txt
+python evaluate.py                 # walk-forward evaluation, writes results.json and docs/evaluation.png (~10 s)
+uvicorn main:app --port 8000       # API docs at http://localhost:8000/docs
+
+# Frontend, in a second terminal
+cd frontend && npm install && npm run dev     # http://localhost:5173
+```
+
+Or `docker-compose up --build` from the repo root. Tests: `cd backend && pip install -r
+requirements-dev.txt && pytest -q`.
+
+## How it works
 
 ```mermaid
-graph TD
-    Client["React + Recharts Dashboard"] <-->|REST / JSON| API["FastAPI Server (async)"]
-    API --> Pipe["Feature Pipeline — SMA · EMA · RSI · Volatility"]
-    API --> Infer["Model Inference"]
-    Infer --> LSTM["PyTorch Stacked LSTM"]
-    Infer --> ARIMA["Statsmodels ARIMA"]
-    Pipe --> Data["Historical price data"]
+graph LR
+    D["data.py<br/>simulated GBM prices (seeded)"] --> F["utils/data_pipeline.py<br/>causal SMA · EMA · RSI · volatility"]
+    F --> L["models/lstm_model.py<br/>LSTM on next log return"]
+    D --> A["models/arima_model.py<br/>ARIMA(p,1,q), order by AIC"]
+    L --> API["main.py · FastAPI"]
+    A --> API
+    E["evaluate.py<br/>walk-forward vs naive"] --> R["results.json"] --> API
+    API --> UI["React + Recharts dashboard"]
 ```
 
-## Key features
-- **Two model families, one interface** — switch between `lstm` and `arima` per request.
-- **On-the-fly feature engineering** — SMA, EMA, RSI, volatility computed per query (no leakage).
-- **Async FastAPI** serving history + multi-step forecast with confidence bounds.
-- **Containerized** with Docker Compose for one-command, environment-parity startup.
+- **LSTM:** 2 layers × 32 units. Input is a 30-day window of [log return, RSI/100, 14-day
+  volatility]; the target is the next log return.
+  - Chronological split. The scaler is fitted on training rows only and saved with the weights.
+  - The last 15% of training rows are validation: they pick the best epoch and give the residual
+    spread that sets the band (±1.96 σ √h in log space).
+  - Multi-step forecasts are recursive. The model is trained on first request per ticker and cached.
+- **ARIMA:** (p,1,q) with p, q ≤ 2, chosen by AIC, with an analytical 95% interval. If a fit fails,
+  the API returns an error. There is no invented fallback.
+- **Every response** carries `"simulated": true` and a `data_source` string, and the UI shows a
+  SIMULATED DATA badge.
 
-## Tech stack
-**Backend:** Python 3.10, FastAPI, Uvicorn, PyTorch, Statsmodels, Pandas, NumPy
-**Frontend:** React, Vite, Recharts · **Ops:** Docker, Docker Compose
+## Results
 
-## Getting started
+`python evaluate.py`: fit on the first 400 of 500 simulated days, then predict each of the last
+100 days using only earlier prices.
 
-```bash
-# Recommended — Docker Compose (from repo root)
-docker-compose up --build
-# Frontend → http://localhost:5173   ·   API docs → http://localhost:8000/docs
+| Ticker | Naive MAE | ARIMA MAE (order) | LSTM MAE | LSTM directional hit-rate (n = 100, ±9.8pp) |
+|---|---:|---:|---:|---:|
+| AAPL | **1.32** | 1.40 (2,1,0) | 1.35 | 38% |
+| MSFT | **3.92** | **3.92** (0,1,0) | 3.98 | 46% |
+| BTC-USD | **5,784** | **5,784** (0,1,0) | 5,982 | 51% |
+
+![First 40 test days per ticker: actual, naive, ARIMA and LSTM one-step forecasts](docs/evaluation.png)
+
+Reading it: on a random walk the best forecast *is* the last price. AIC agrees and picks
+ARIMA(0,1,0), which is the naive model, on two of three series. The LSTM lands within a few percent
+of naive and never below it. Its hit-rates sit around 50%. AAPL's 38% is outside the ±9.8pp band
+for one seed, but on data with no signal that is noise in the other direction, not a learned
+anti-signal. This is the expected result, and the harness's job is to show it rather than hide it.
+
+## Limitations
+
+- **No real market data.** `data.load_csv()` accepts a `date,close` file, but no real series has
+  been evaluated here. Any claim about real prices would need that run first.
+- A single seed for the LSTM in the evaluation, a 100-day test window, and no hyperparameter search.
+- Recursive multi-step LSTM forecasts reuse the model's own outputs, so their bands assume
+  independent errors.
+
+## Project layout
+
+```
+backend/
+  data.py               simulated prices (+ CSV loader)
+  utils/data_pipeline.py   causal indicators
+  models/lstm_model.py  LSTMForecaster: fit, one-step, recursive forecast, save/load
+  models/arima_model.py AIC order selection, forecast, causal one-step predictions
+  evaluate.py           walk-forward evaluation -> results.json, docs/evaluation.png
+  main.py               FastAPI: /api/forecast, /api/evaluation, /api/tickers
+  tests/                pytest: causality, train-only scaling, AIC, API labelling
+frontend/               React + Vite + Recharts dashboard
 ```
 
-<details><summary>Manual setup</summary>
+## License
 
-```bash
-# Backend
-cd backend && python -m venv venv && source venv/Scripts/activate   # Windows: venv\Scripts\activate
-pip install -r requirements.txt && python main.py        # → http://localhost:8000
-
-# Frontend
-cd ../frontend && npm install && npm run dev              # → http://localhost:5173
-```
-</details>
-
-## API
-`GET /api/forecast?ticker=AAPL&model=lstm&horizon=10` → returns historical points (price, SMA, RSI)
-plus a forecast path with lower/upper bounds. Full interactive docs at `/docs`.
-
-## Notes
-The LSTM is a 2-layer stack (64 hidden units, 30-step window over `[close, volatility, RSI]`);
-ARIMA orders are selected by AIC. Deployment configs included for Vercel (frontend) and Render
-(backend) via `vercel.json` / `render.yaml`.
-
-> _Add a dashboard screenshot/GIF here — recommended before sharing with recruiters._
+MIT, see [LICENSE](LICENSE).

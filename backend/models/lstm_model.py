@@ -1,90 +1,127 @@
+"""Stacked LSTM that predicts the next log return from a 30-step window of
+[log return, RSI/100, rolling volatility].
+
+It is actually trained, on a chronological split:
+- the scaler is fitted on the training rows only and saved with the weights;
+- the last 15% of the training rows are a validation slice, used to keep the
+  best epoch and to measure the residual spread that sets the interval width;
+- nothing after `train_end` is ever seen during fitting.
+"""
+from __future__ import annotations
+
+from dataclasses import dataclass, field
+
+import numpy as np
+import pandas as pd
 import torch
 import torch.nn as nn
-import numpy as np
-from typing import List, Tuple
+
+from utils.data_pipeline import enrich_dataset
+
 
 class StackedLSTM(nn.Module):
-    """
-    Two-layer stacked LSTM network for forecasting sequence targets from
-    multivariate technical indicators.
-    """
-    def __init__(self, input_dim: int = 3, hidden_dim: int = 64, num_layers: int = 2, output_dim: int = 1):
-        super(StackedLSTM, self).__init__()
-        self.lstm = nn.LSTM(
-            input_size=input_dim,
-            hidden_size=hidden_dim,
-            num_layers=num_layers,
-            batch_first=True,
-            dropout=0.2 if num_layers > 1 else 0.0
-        )
-        self.fc = nn.Linear(hidden_dim, output_dim)
-        
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        # Input shape: (batch_size, sequence_length, input_features)
-        lstm_out, _ = self.lstm(x)
-        # Take the output of the final time step
-        last_out = lstm_out[:, -1, :]
-        return self.fc(last_out)
+    def __init__(self, input_dim: int = 3, hidden_dim: int = 32, num_layers: int = 2):
+        super().__init__()
+        self.lstm = nn.LSTM(input_dim, hidden_dim, num_layers=num_layers, batch_first=True, dropout=0.2)
+        self.fc = nn.Linear(hidden_dim, 1)
 
-def get_forecast(prices: List[float], rsi: List[float], volatility: List[float], horizon: int = 10) -> List[float]:
-    """
-    Runs recursive multi-step inference using a PyTorch LSTM model.
-    To ensure execution, this falls back to a deterministic model if weights are uninitialized.
-    """
-    # Parameters for normalization
-    prices_arr = np.array(prices)
-    min_val, max_val = prices_arr.min(), prices_arr.max()
-    scale = lambda x: (x - min_val) / (max_val - min_val + 1e-9)
-    descale = lambda y: y * (max_val - min_val + 1e-9) + min_val
-    
-    # Format current sequence (last 30 steps)
-    seq_len = 30
-    if len(prices_arr) < seq_len:
-        # Pad with first element if too short
-        pad_len = seq_len - len(prices_arr)
-        prices_arr = np.pad(prices_arr, (pad_len, 0), 'edge')
-        rsi_arr = np.pad(np.array(rsi), (pad_len, 0), 'edge')
-        vol_arr = np.pad(np.array(volatility), (pad_len, 0), 'edge')
-    else:
-        prices_arr = prices_arr[-seq_len:]
-        rsi_arr = np.array(rsi)[-seq_len:]
-        vol_arr = np.array(volatility)[-seq_len:]
-        
-    # Scale variables
-    s_prices = scale(prices_arr)
-    s_rsi = rsi_arr / 100.0
-    s_vol = vol_arr
-    
-    # Construct input tensor shape (1, seq_len, 3)
-    features = np.stack([s_prices, s_rsi, s_vol], axis=-1)
-    input_tensor = torch.tensor(features, dtype=torch.float32).unsqueeze(0)
-    
-    # Instantiate model
-    model = StackedLSTM(input_dim=3, hidden_dim=32, num_layers=2)
-    model.eval()
-    
-    forecasts = []
-    current_seq = input_tensor.clone()
-    
-    with torch.no_grad():
-        for _ in range(horizon):
-            pred = model(current_seq) # Output is scaled next price
-            next_price_scaled = pred.item()
-            forecasts.append(descale(next_price_scaled))
-            
-            # Update sliding window for recursive prediction:
-            # We slide out the oldest step and slide in the new prediction
-            next_step_features = torch.tensor([[[next_price_scaled, 0.5, 0.01]]], dtype=torch.float32)
-            current_seq = torch.cat([current_seq[:, 1:, :], next_step_features], dim=1)
-            
-    # Add minor drift to make the visualization realistic
-    last_price = prices[-1]
-    trend = (forecasts[-1] - forecasts[0]) / horizon if horizon > 1 else 0
-    realistic_forecasts = []
-    for i, f in enumerate(forecasts):
-        # Blend the model's recursive output with statistical drift to look natural
-        noise = np.random.normal(0, last_price * 0.005)
-        realistic_f = last_price + trend * (i + 1) + noise
-        realistic_forecasts.append(float(realistic_f))
-        
-    return realistic_forecasts
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        out, _ = self.lstm(x)
+        return self.fc(out[:, -1, :])
+
+
+def features(close: np.ndarray) -> np.ndarray:
+    """Causal features: every row uses prices up to and including that row only."""
+    df = enrich_dataset(pd.DataFrame({"close": close}))
+    log_ret = np.concatenate([[0.0], np.diff(np.log(close))])
+    return np.column_stack([log_ret, df["rsi"].to_numpy() / 100.0, df["volatility"].to_numpy()])
+
+
+@dataclass
+class LSTMForecaster:
+    seq_len: int = 30
+    hidden_dim: int = 32
+    epochs: int = 60
+    lr: float = 3e-3
+    seed: int = 0
+    val_frac: float = 0.15
+    model: StackedLSTM | None = field(default=None, repr=False)
+
+    def _windows(self, f: np.ndarray, targets: range):
+        idx = [j for j in targets if j - self.seq_len >= 1]
+        x = np.stack([f[j - self.seq_len : j] for j in idx])
+        y = f[idx, 0]  # next log return
+        return idx, x, y
+
+    def fit(self, close: np.ndarray, train_end: int | None = None) -> "LSTMForecaster":
+        torch.manual_seed(self.seed)
+        train_end = train_end or len(close)
+        f = features(close[:train_end])
+        val_start = int(train_end * (1 - self.val_frac))
+        self.mean_ = f[:val_start].mean(0)
+        self.std_ = f[:val_start].std(0) + 1e-8
+        fs = (f - self.mean_) / self.std_
+        _, xtr, ytr = self._windows(fs, range(1, val_start))
+        _, xva, yva = self._windows(fs, range(val_start, train_end))
+        xtr, ytr = torch.tensor(xtr, dtype=torch.float32), torch.tensor(ytr, dtype=torch.float32)
+        xva, yva = torch.tensor(xva, dtype=torch.float32), torch.tensor(yva, dtype=torch.float32)
+
+        self.model = StackedLSTM(f.shape[1], self.hidden_dim)
+        opt = torch.optim.Adam(self.model.parameters(), lr=self.lr)
+        loss_fn = nn.MSELoss()
+        best, best_state = np.inf, None
+        for _ in range(self.epochs):
+            self.model.train()
+            opt.zero_grad()
+            loss = loss_fn(self.model(xtr).squeeze(1), ytr)
+            loss.backward()
+            opt.step()
+            self.model.eval()
+            with torch.no_grad():
+                val = loss_fn(self.model(xva).squeeze(1), yva).item()
+            if val < best:
+                best, best_state = val, {k: v.clone() for k, v in self.model.state_dict().items()}
+        self.model.load_state_dict(best_state)
+        self.model.eval()
+        with torch.no_grad():
+            resid = (self.model(xva).squeeze(1) - yva).numpy() * self.std_[0]
+        # Residual spread of the predicted log return on validation data: this, not a constant, sets the bands.
+        self.resid_std_ = float(np.std(resid))
+        self.train_end_ = train_end
+        return self
+
+    def predict_return(self, close: np.ndarray) -> float:
+        """Predicted log return for the step after the last price in `close`."""
+        fs = (features(close) - self.mean_) / self.std_
+        x = torch.tensor(fs[-self.seq_len :][None], dtype=torch.float32)
+        with torch.no_grad():
+            return float(self.model(x).item() * self.std_[0] + self.mean_[0])
+
+    def one_step_predictions(self, close: np.ndarray, idx: np.ndarray) -> np.ndarray:
+        """Price forecast for each index j, using prices strictly before j."""
+        return np.array([close[j - 1] * np.exp(self.predict_return(close[:j])) for j in idx])
+
+    def forecast(self, close: np.ndarray, horizon: int):
+        """Recursive multi-step forecast. Interval: ±1.96 × validation residual std × √h, in log space."""
+        path = list(close)
+        out = []
+        for h in range(1, horizon + 1):
+            nxt = path[-1] * np.exp(self.predict_return(np.asarray(path)))
+            path.append(nxt)
+            half = 1.96 * self.resid_std_ * np.sqrt(h)
+            out.append({"price": float(nxt), "lower": float(nxt * np.exp(-half)), "upper": float(nxt * np.exp(half))})
+        return out
+
+    def save(self, path: str) -> None:
+        torch.save({"state_dict": self.model.state_dict(), "mean": self.mean_, "std": self.std_,
+                    "resid_std": self.resid_std_, "seq_len": self.seq_len, "hidden_dim": self.hidden_dim}, path)
+
+    @classmethod
+    def load(cls, path: str) -> "LSTMForecaster":
+        ck = torch.load(path, weights_only=False)
+        m = cls(seq_len=ck["seq_len"], hidden_dim=ck["hidden_dim"])
+        m.model = StackedLSTM(3, ck["hidden_dim"])
+        m.model.load_state_dict(ck["state_dict"])
+        m.model.eval()
+        m.mean_, m.std_, m.resid_std_ = ck["mean"], ck["std"], ck["resid_std"]
+        return m

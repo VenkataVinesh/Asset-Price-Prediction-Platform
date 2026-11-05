@@ -1,0 +1,93 @@
+{
+  "data_source": "simulated: seeded geometric Brownian motion (no market data)",
+  "protocol": "fit on first 80%, one-step walk-forward on the rest",
+  "tickers": {
+    "AAPL": {
+      "naive": {
+        "mae": 1.318090048777452,
+        "rmse": 1.696632249144961,
+        "hit_rate": null,
+        "directional_calls": 0,
+        "margin_95_pp": null
+      },
+      "arima": {
+        "mae": 1.396636685985718,
+        "rmse": 1.8113615735889337,
+        "hit_rate": 0.47,
+        "directional_calls": 100,
+        "margin_95_pp": 9.8,
+        "order": [
+          2,
+          1,
+          0
+        ]
+      },
+      "lstm": {
+        "mae": 1.3544484577071672,
+        "rmse": 1.736348530478159,
+        "hit_rate": 0.38,
+        "directional_calls": 100,
+        "margin_95_pp": 9.8
+      },
+      "test_points": 100
+    },
+    "MSFT": {
+      "naive": {
+        "mae": 3.9172666667124387,
+        "rmse": 5.007323124584221,
+        "hit_rate": null,
+        "directional_calls": 0,
+        "margin_95_pp": null
+      },
+      "arima": {
+        "mae": 3.9172666667124405,
+        "rmse": 5.007323124584222,
+        "hit_rate": null,
+        "directional_calls": 0,
+        "margin_95_pp": null,
+        "order": [
+          0,
+          1,
+          0
+        ]
+      },
+      "lstm": {
+        "mae": 3.983323285383202,
+        "rmse": 5.0712781421868005,
+        "hit_rate": 0.46,
+        "directional_calls": 100,
+        "margin_95_pp": 9.8
+      },
+      "test_points": 100
+    },
+    "BTC-USD": {
+      "naive": {
+        "mae": 5784.401201043399,
+        "rmse": 7216.553795272942,
+        "hit_rate": null,
+        "directional_calls": 0,
+        "margin_95_pp": null
+      },
+      "arima": {
+        "mae": 5784.401201043399,
+        "rmse": 7216.553795272942,
+        "hit_rate": null,
+        "directional_calls": 0,
+        "margin_95_pp": null,
+        "order": [
+          0,
+          1,
+          0
+        ]
+      },
+      "lstm": {
+        "mae": 5981.923628172834,
+        "rmse": 7447.544523893617,
+        "hit_rate": 0.51,
+        "directional_calls": 100,
+        "margin_95_pp": 9.8
+      },
+      "test_points": 100
+    }
+  }
+}
