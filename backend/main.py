@@ -1,135 +1,102 @@
+"""FastAPI service: history with indicators, plus LSTM or ARIMA multi-step forecasts.
+
+Every response carries `data_source`. Prices are simulated (see data.py); the
+models are real: the LSTM is trained on first use per ticker and the ARIMA order
+is chosen by AIC. If a model fails, the request fails. Nothing is invented in
+its place.
+"""
+from __future__ import annotations
+
+import json
+import os
+from datetime import date, timedelta
+from functools import lru_cache
+
 import uvicorn
-from fastapi import FastAPI, Query, HTTPException
+from fastapi import FastAPI, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
-import pandas as pd
-import numpy as np
-from datetime import datetime, timedelta
-from typing import List, Dict
 
-# Import local ML modules
-from utils import data_pipeline
-from models import lstm_model
+from data import DATA_SOURCE, TICKER_CONFIGS, simulated_prices
 from models import arima_model
+from models.lstm_model import LSTMForecaster
+from utils import data_pipeline
 
-app = FastAPI(
-    title="Asset Price Prediction API",
-    description="Asynchronous prediction backend serving LSTM and ARIMA forecasts",
-    version="1.0.0"
-)
+app = FastAPI(title="Asset Price Prediction API", version="2.0.0",
+              description="LSTM vs ARIMA forecasts on SIMULATED prices, with a walk-forward evaluation against a naive baseline.")
+app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["GET"], allow_headers=["*"])
 
-# Enable CORS for frontend integration
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
+HISTORY_DAYS = 60
+RESULTS_PATH = os.path.join(os.path.dirname(__file__), "results.json")
 
-# Simulated historical data generation parameters
-TICKER_CONFIGS = {
-    "AAPL": {"start_price": 175.0, "daily_std": 0.012, "drift": 0.0005},
-    "MSFT": {"start_price": 420.0, "daily_std": 0.010, "drift": 0.0008},
-    "BTC-USD": {"start_price": 64000.0, "daily_std": 0.035, "drift": 0.0015}
-}
 
-def generate_historical_data(ticker: str, days: int = 60) -> pd.DataFrame:
-    """Generates a realistic random walk pricing dataset for a given ticker."""
-    if ticker not in TICKER_CONFIGS:
-        raise ValueError(f"Unknown ticker: {ticker}")
-        
-    config = TICKER_CONFIGS[ticker]
-    np.random.seed(42) # Seed to ensure consistency for demonstration
-    
-    prices = [config["start_price"]]
-    for _ in range(days - 1):
-        change_pct = np.random.normal(config["drift"], config["daily_std"])
-        next_price = prices[-1] * (1.0 + change_pct)
-        prices.append(float(next_price))
-        
-    # Create dates ending today
-    today = datetime.now().date()
-    dates = [today - timedelta(days=i) for i in range(days)]
-    dates.reverse()
-    
-    df = pd.DataFrame({
-        "date": [d.strftime("%Y-%m-%d") for d in dates],
-        "close": prices
-    })
-    return df
+@lru_cache(maxsize=8)
+def lstm_for(ticker: str) -> LSTMForecaster:
+    close = simulated_prices(ticker)["close"].to_numpy()
+    return LSTMForecaster(seed=0).fit(close)
 
-@app.get("/api/tickers", response_model=List[str])
+
+def evaluation_for(ticker: str) -> dict | None:
+    if not os.path.exists(RESULTS_PATH):
+        return None
+    with open(RESULTS_PATH) as f:
+        return json.load(f)["tickers"].get(ticker)
+
+
+@app.get("/api/tickers", response_model=list[str])
 async def get_tickers():
-    """Returns the list of supported asset tickers."""
-    return list(TICKER_CONFIGS.keys())
+    return list(TICKER_CONFIGS)
+
+
+@app.get("/api/evaluation")
+async def get_evaluation():
+    if not os.path.exists(RESULTS_PATH):
+        raise HTTPException(404, "No evaluation yet. Run `python evaluate.py` in backend/.")
+    with open(RESULTS_PATH) as f:
+        return json.load(f)
+
 
 @app.get("/api/forecast")
-async def get_forecast(
-    ticker: str = Query("AAPL", description="Asset symbol"),
-    model: str = Query("lstm", description="Forecasting model to run: lstm or arima"),
-    horizon: int = Query(10, description="Forecasting steps ahead", ge=1, le=30)
+def get_forecast(
+    ticker: str = Query("AAPL"),
+    model: str = Query("lstm", pattern="^(lstm|arima)$"),
+    horizon: int = Query(10, ge=1, le=30),
 ):
-    """
-    Simulates feature extraction, runs ML forecast model, and returns
-    historical indicators alongside predictions with confidence bounds.
-    """
     if ticker not in TICKER_CONFIGS:
-        raise HTTPException(status_code=404, detail="Ticker not supported")
-        
-    model = model.lower()
-    if model not in ["lstm", "arima"]:
-        raise HTTPException(status_code=400, detail="Invalid model type. Supported: lstm, arima")
-        
-    # 1. Generate and enrich historical time series
+        raise HTTPException(404, "Ticker not supported")
+    df = simulated_prices(ticker)
+    close = df["close"].to_numpy()
+    enriched = data_pipeline.enrich_dataset(df.tail(HISTORY_DAYS + 30), price_column="close").tail(HISTORY_DAYS)
+
     try:
-        df_hist = generate_historical_data(ticker, days=60)
-        df_enriched = data_pipeline.enrich_dataset(df_hist, price_column="close")
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Data pipeline error: {str(e)}")
-        
-    # Convert dataframe back to dictionary payload
-    history_list = df_enriched.to_dict(orient="records")
-    close_prices = df_enriched["close"].tolist()
-    rsi_list = df_enriched["rsi"].tolist()
-    vol_list = df_enriched["volatility"].tolist()
-    
-    # 2. Run selected forecast inference engine
-    forecast_points = []
-    confidence_intervals = []
-    
-    if model == "lstm":
-        forecast_prices = lstm_model.get_forecast(close_prices, rsi_list, vol_list, horizon=horizon)
-        # For LSTM, simulate confidence intervals widening with time steps
-        last_price = close_prices[-1]
-        for i, val in enumerate(forecast_prices):
-            error_margin = last_price * 0.015 * (i + 1)
-            confidence_intervals.append({
-                "lower": val - error_margin,
-                "upper": val + error_margin
-            })
-    else: # arima
-        forecast_prices, confidence_intervals = arima_model.get_forecast(close_prices, horizon=horizon)
-        
-    # 3. Format future forecasting dates
-    last_date_str = history_list[-1]["date"]
-    last_date = datetime.strptime(last_date_str, "%Y-%m-%d").date()
-    
-    forecast_list = []
-    for i in range(horizon):
-        next_date = last_date + timedelta(days=i+1)
-        forecast_list.append({
-            "date": next_date.strftime("%Y-%m-%d"),
-            "price": forecast_prices[i],
-            "lower_bound": confidence_intervals[i]["lower"],
-            "upper_bound": confidence_intervals[i]["upper"]
-        })
-        
+        if model == "lstm":
+            m = lstm_for(ticker)
+            points = m.forecast(close, horizon)
+            detail = {"type": "stacked LSTM (2x32), trained on this series",
+                      "interval": "±1.96 × validation residual std of log returns × √h",
+                      "validation_residual_std": m.resid_std_}
+        else:
+            values, intervals, info = arima_model.get_forecast(close.tolist(), horizon)
+            points = [{"price": v, **iv} for v, iv in zip(values, intervals)]
+            detail = {"type": f"ARIMA{tuple(info['order'])}, order chosen by AIC", "interval": "analytical 95%", **info}
+    except Exception as exc:  # surface the failure; do not fabricate a forecast
+        raise HTTPException(502, f"{model} forecast failed: {exc}") from exc
+
+    last = date.fromisoformat(df["date"].iloc[-1])
     return {
         "ticker": ticker,
         "model": model,
-        "history": history_list,
-        "forecast": forecast_list
+        "data_source": DATA_SOURCE,
+        "simulated": True,
+        "model_detail": detail,
+        "evaluation": evaluation_for(ticker),
+        "history": enriched.to_dict(orient="records"),
+        "forecast": [
+            {"date": (last + timedelta(days=i + 1)).isoformat(), "price": p["price"],
+             "lower_bound": p["lower"], "upper_bound": p["upper"]}
+            for i, p in enumerate(points)
+        ],
     }
+
 
 if __name__ == "__main__":
     uvicorn.run("main:app", host="0.0.0.0", port=8000, reload=True)
